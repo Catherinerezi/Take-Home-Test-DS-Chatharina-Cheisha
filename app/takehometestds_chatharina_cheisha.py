@@ -91,7 +91,6 @@ if "Courier_Experince_yrs" in X.columns and "Courier_Experience_yrs" not in X.co
 
 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 st.success(f"Split data → X_train: {X_train.shape}, X_test: {X_test.shape}")
-pipe = best_pipe
 
 cat_cols = df.select_dtypes(include=["object", "string"]).columns
 
