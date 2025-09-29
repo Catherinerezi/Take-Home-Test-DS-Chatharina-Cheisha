@@ -91,6 +91,7 @@ if "Courier_Experince_yrs" in X.columns and "Courier_Experience_yrs" not in X.co
 
 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 st.success(f"Split data → X_train: {X_train.shape}, X_test: {X_test.shape}")
+pipe = best_pipe
 
 cat_cols = df.select_dtypes(include=["object", "string"]).columns
 
@@ -318,6 +319,7 @@ st.dataframe(cmp, use_container_width=True)
 best_name = cmp.loc[0, "model"]
 best_pipe = best_models[best_name]
 st.success(f"Best by CV (MAE): **{best_name}**")
+pipe = best_pipe
 
 """Pemilihan Model"""
 
@@ -542,72 +544,67 @@ df_te["y_pred"] = y_pred
 df_te["abs_err"] = (df_te["y_true"] - df_te["y_pred"]).abs()
 
 for c in [col for col in ["Weather","Traffic_Level","Time_of_Day","Vehicle_Type"] if col in df_te.columns]:
-  seg = (df_te.groupby(c)["abs_err"].agg(["count","mean","median","max"]).sort_values("mean"))
-  print(f"\n Segment MAE by {c}"); display(seg.head(10))
+    seg = (df_te.groupby(c)["abs_err"].agg(["count","mean","median","max"]).sort_values("mean"))
+    st.markdown(f"**Segment MAE by `{c}`**")
+    st.dataframe(seg.head(10), use_container_width=True)
 
 """PDP (Partial Dependence) untuk fitur numerik utama"""
-
-# pilih 2–3 fitur numerik yang relevan
+# Pilih kandidat fitur
 cand = [f for f in ["Distance_km","Preparation_Time_min","Courier_Experience_yrs"] if f in X_test.columns]
 if not cand:
-  cand = num_cols[:min(3, len(num_cols))]
+    cand = num_cols[:min(3, len(num_cols))]
 
+# PDP kind="average"
 fig, axes = plt.subplots(1, len(cand), figsize=(6*len(cand), 4))
 if len(cand) == 1:
-  axes = [axes]
-
-fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    axes = [axes]
 for ax, f in zip(axes, cand):
-  PartialDependenceDisplay.from_estimator(
-    pipe, X_test, [f],
-    kind="average",
-    grid_resolution=50,
-    ax=ax
-  )
-  ax.set_title(f"PDP — {f}")
-
+    PartialDependenceDisplay.from_estimator(
+        pipe, X_test, [f],
+        kind="average",
+        grid_resolution=50,
+        ax=ax
+    )
+    ax.set_title(f"PDP — {f}")
 plt.tight_layout()
 st.pyplot(fig)
 
-cand = [f for f in ["Distance_km","Preparation_Time_min","Courier_Experience_yrs"] if f in X_test.columns]
-if not cand:
-  cand = num_cols[:min(3, len(num_cols))]
-
+# PDP kind="both"
 fig, axes = plt.subplots(1, len(cand), figsize=(6*len(cand), 4))
 if len(cand) == 1:
-  axes = [axes]
-
-fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    axes = [axes]
 for ax, f in zip(axes, cand):
-  PartialDependenceDisplay.from_estimator(
-    pipe, X_test, [f],
-    kind="both",
-    grid_resolution=50,
-    ax=ax
-  )
-  ax.set_title(f"PDP — {f}")
-
+    PartialDependenceDisplay.from_estimator(
+        pipe, X_test, [f],
+        kind="both",
+        grid_resolution=50,
+        ax=ax
+    )
+    ax.set_title(f"PDP — {f}")
 plt.tight_layout()
 st.pyplot(fig)
 
+# PDP pairs
 pairs = [("Distance_km","Preparation_Time_min"),
          ("Distance_km","Courier_Experience_yrs")]
-for a,b in pairs:
+for a, b in pairs:
     if a in X_test.columns and b in X_test.columns:
-        PartialDependenceDisplay.from_estimator(pipe, X_test, [(a,b)], grid_resolution=30)
-        plt.title(f"PDP — ({a}, {b})")
+        fig, ax = plt.subplots(1, 1, figsize=(6, 4))
+        PartialDependenceDisplay.from_estimator(pipe, X_test, [(a, b)], grid_resolution=30, ax=ax)
+        ax.set_title(f"PDP — ({a}, {b})")
         st.pyplot(fig)
-
-for name, p in [("Random Forest", rf_pipe), ("XGBoost", xgb_pipe)]:
+        
+for name, p in [("Random Forest", rf_pipe if 'rf_pipe' in globals() else None),
+                ("XGBoost", xgb_pipe if 'xgb_pipe' in globals() else None)]:
     if p is not None:
         for f in ["Distance_km","Preparation_Time_min","Courier_Experience_yrs"]:
             if f in X_test.columns:
-                PartialDependenceDisplay.from_estimator(p, X_test, [f], grid_resolution=50)
-                plt.title(f"PDP — {name} — {f}")
+                fig, ax = plt.subplots(1, 1, figsize=(6, 4))
+                PartialDependenceDisplay.from_estimator(p, X_test, [f], grid_resolution=50, ax=ax)
+                ax.set_title(f"PDP — {name} — {f}")
                 st.pyplot(fig)
 
 """Optimasi/tuning via CV"""
-
 # helper RMSE (kompatibel versi sklearn lama/baru)
 def rmse_metric(y_true, y_pred):
   try:
