@@ -12,47 +12,85 @@ Original file is located at
 Membangun model prediktif untuk memperkirakan Delivery_Time_min (menit) per pesanan pada layanan pengantaran makanan, agar tim operasional dapat mengestimasi ETA yang lebih akurat dan mengoptimalkan alokasi kurir.
 """
 
-!pip install --upgrade scikit-learn
-
-# Commented out IPython magic to ensure Python compatibility.
-from scipy.stats import norm
-import matplotlib.pyplot as plt
+import os, datetime as dt
 import numpy as np
 import pandas as pd
-import seaborn as sns
-# %matplotlib inline
-from google.colab import drive
-import os
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import MultiLabelBinarizer
-from sklearn.preprocessing import MinMaxScaler
-from sklearn.model_selection import GridSearchCV, RandomizedSearchCV
+import matplotlib.pyplot as plt
+import streamlit as st
+import altair as alt
 
-file_id = '1qI18G7Rjr5Axqz-HawadpTzSnTwf5jeQ'
-download_url = f'https://drive.google.com/uc?export=download&id={file_id}'
+# sklearn
+from sklearn.model_selection import train_test_split, KFold, GridSearchCV
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score, make_scorer
+from sklearn.linear_model import Ridge, Lasso
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.inspection import permutation_importance, PartialDependenceDisplay
+from inspect import signature
 
-df = pd.read_csv(download_url)
+st.set_page_config(page_title="Prediksi Waktu Pengantaran", layout="wide")
+st.title("📦 Prediksi Waktu Pengantaran Makanan (ETA)")
+st.caption("Versi Streamlit dengan tooltip interaktif")
 
-"""# Data Undertanding"""
+"""Data Undertanding"""
 
-df.head()
+@st.cache_data(show_spinner=True)
+def load_data():
+    file_id = '1qI18G7Rjr5Axqz-HawadpTzSnTwf5jeQ'
+    url = f'https://drive.google.com/uc?export=download&id={file_id}'
+    df = pd.read_csv(url)
+    return df
 
-df.describe().T
+df = load_data()
 
-df.shape
+st.subheader("Data Understanding")
+c1, c2, c3 = st.columns([2,2,3])
+with c1:
+    st.write("Shape:", df.shape)
+    st.dataframe(df.head(), use_container_width=True)
+with c2:
+    st.write("Describe")
+    st.dataframe(df.describe().T, use_container_width=True)
+with c3:
+    st.write("Dtypes")
+    st.json({col: str(tp) for col, tp in df.dtypes.items()})
 
-df.info()
+# data cleaning
 
-"""# Cek Duplikat"""
+cat_cols = df.select_dtypes(include=["object", "string"]).columns
+for c in cat_cols:
+    df[c] = (df[c].astype("string").str.strip().str.replace(r"\s+", " ", regex=True))
 
-df.duplicated().sum()
+for c in cat_cols:
+    m = df[c].mode(dropna=True)
+    if not m.empty:
+        df[c] = df[c].fillna(m.iat[0])
 
-"""# Cek Missing Value"""
+candidate_cols = ["Courier_Experience_yrs"]
+col = next((c for c in candidate_cols if c in df.columns), None)
+if col is None:
+    st.error(f"Kolom tidak ditemukan. Kolom tersedia: {list(df.columns)}")
+    st.stop()
 
-df.isnull().sum()
+df[col] = pd.to_numeric(df[col], errors="coerce")
+df[col] = df[col].fillna(df[col].median(skipna=True))
 
-missing_percentage = df.isnull().sum()/df.shape[0]*100
-missing_percentage.sort_values(ascending=False)
+TARGET = "Delivery_Time_min"
+assert TARGET in df.columns, f"Target '{TARGET}' tidak ada."
+
+id_like = [c for c in df.columns if c.lower() in {"order_id", "id"}]
+X = df.drop(columns=[TARGET] + id_like, errors="ignore")
+y = df[TARGET]
+
+if "Courier_Experince_yrs" in X.columns and "Courier_Experience_yrs" not in X.columns:
+    X = X.rename(columns={"Courier_Experince_yrs": "Courier_Experience_yrs"})
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+st.success(f"Split data → X_train: {X_train.shape}, X_test: {X_test.shape}")
 
 cat_cols = df.select_dtypes(include=["object", "string"]).columns
 
@@ -82,7 +120,7 @@ missing_percentage.sort_values(ascending=False)
 
 df.duplicated().sum()
 
-"""# Pembagian Data Set"""
+"""Pembagian Data Set"""
 
 TARGET = "Delivery_Time_min"
 assert TARGET in df.columns, f"Target '{TARGET}' tidak ada."
@@ -103,261 +141,187 @@ X_train, X_test, y_train, y_test = train_test_split(
 )
 print(f"X_train: {X_train.shape}, X_test: {X_test.shape}")
 
-"""# EDA ringan + importance eksploratif
+"""EDA ringan + importance eksploratif
 
-## EDA ringan di TRAIN
+EDA ringan di TRAIN
 """
-
-from sklearn.model_selection import train_test_split, cross_val_score, KFold
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.inspection import permutation_importance
-
-from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from sklearn.impute import SimpleImputer
-
-from sklearn.linear_model import Ridge, Lasso
-from sklearn.tree import DecisionTreeRegressor
-from sklearn.ensemble import RandomForestRegressor
-
-try:
-  from xgboost import XGBRegressor
-  has_xgb = True
-except Exception:
-  has_xgb = False
-  print("[INFO] xgboost tidak terpasang. Lewati model XGBoost.")
 
 num_cols = X_train.select_dtypes(include=[np.number]).columns.tolist()
 cat_cols = X_train.select_dtypes(include=["object", "string"]).columns.tolist()
 
-print(">> Shape TRAIN:", X_train.shape)
-print(">> Tipe kolom:  numerik =", len(num_cols), ", kategori =", len(cat_cols))
-print("\n>> Missing % per kolom (TRAIN):")
-display(((X_train.isna().mean() * 100).sort_values(ascending=False)).round(2))
-
-print("\n>> Target stats (TRAIN):")
-display(y_train.describe()[["count","mean","std","min","25%","50%","75%","max"]].round(2))
-
-# Korelasi numerik sederhana (hanya numerik di train)
-num_cols = X_train.select_dtypes(include=[np.number]).columns.tolist()
-cat_cols = X_train.select_dtypes(exclude=[np.number]).columns.tolist()
+c1, c2 = st.columns(2)
+with c1:
+    miss = ((X_train.isna().mean() * 100).sort_values(ascending=False)).round(2)
+    st.write("Missing % per kolom (TRAIN)")
+    st.dataframe(miss, use_container_width=True)
+with c2:
+    st.write("Target stats (TRAIN)")
+    st.dataframe(y_train.describe()[["count","mean","std","min","25%","50%","75%","max"]].round(2))
 
 if len(num_cols) > 1:
     corr = X_train[num_cols].join(y_train).corr()[TARGET].drop(TARGET).sort_values(ascending=False)
-    print("\n>> Korelasi fitur numerik vs target (TRAIN):")
-    display(corr.round(3))
+    corr_df = corr.round(3).reset_index().rename(columns={'index': 'feature', TARGET: 'corr'})
+    st.write("Korelasi numerik vs target (TRAIN)")
+    st.altair_chart(
+        alt.Chart(corr_df).mark_bar().encode(
+            x=alt.X("corr:Q"),
+            y=alt.Y("feature:N", sort='-x'),
+            tooltip=["feature", "corr"]
+        ).properties(height=max(200, 20*len(corr_df))),
+        use_container_width=True
+    )
 
-"""## Feature Imprtance Eksploratif"""
+""" Feature Imprtance Eksploratif"""
 
 # Preprocess untuk importance (imputer & OHE)
-num_transform = Pipeline([
-  ("imputer", SimpleImputer(strategy="median")),
-])
-cat_transform = Pipeline([
-  ("imputer", SimpleImputer(strategy="most_frequent")),
-  ("ohe", OneHotEncoder(handle_unknown="ignore"))
-])
+num_transform = Pipeline([("imputer", SimpleImputer(strategy="median"))])
+cat_transform = Pipeline([("imputer", SimpleImputer(strategy="most_frequent")),
+                          ("ohe", OneHotEncoder(handle_unknown="ignore"))])
+
 preprocess = ColumnTransformer(
-  transformers=[
-    ("num", num_transform, num_cols),
-    ("cat", cat_transform, cat_cols),
-  ],
-  remainder="drop"
+    transformers=[("num", num_transform, num_cols),
+                  ("cat", cat_transform, cat_cols)]
 )
 
-# Model baseline untuk importance eksploratif
-rf = RandomForestRegressor(
-  n_estimators=300, random_state=42, n_jobs=-1
-)
-pipe_rf = Pipeline([
-  ("preprocess", preprocess),
-  ("model", rf)
-])
+rf = RandomForestRegressor(n_estimators=300, random_state=42, n_jobs=-1)
+pipe_rf = Pipeline([("preprocess", preprocess), ("model", rf)])
 
-# Scorer
-from sklearn.metrics import make_scorer, mean_absolute_error, mean_squared_error, r2_score
-import numpy as np
-
+# Scorers
+def _rmse(y_true, y_pred): return np.sqrt(mean_squared_error(y_true, y_pred))
 mae_scorer  = make_scorer(mean_absolute_error, greater_is_better=False)
-def _rmse(y_true, y_pred):
-  return np.sqrt(mean_squared_error(y_true, y_pred))
 rmse_scorer = make_scorer(_rmse, greater_is_better=False)
 r2_scorer   = make_scorer(r2_score)
 
 scorers = {"MAE": mae_scorer, "RMSE": rmse_scorer, "R2": r2_scorer}
 
-# Rata-rata antar fold jadi tiga tabel importance (robust ke mismatch panjang)
-import numpy as np, pandas as pd
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-
-# CV
+# Importance eksploratif (ringkas)
 cv = KFold(n_splits=5, shuffle=True, random_state=42)
-
-# Kolom numerik & kategori dari TRAIN
-num_cols = X_train.select_dtypes(include=[np.number]).columns.tolist()
-cat_cols = X_train.select_dtypes(include=['object','string']).columns.tolist()
 feat_orig = list(num_cols) + list(cat_cols)
-assert len(feat_orig) > 0, "Tidak ada fitur terdeteksi di X_train."
-
-# Pipeline RF sederhana utk importance (preprocess + model)
-preprocess = ColumnTransformer(
-  [('num', Pipeline([('imputer', SimpleImputer(strategy='median'))]), num_cols),
-  ('cat', Pipeline([('imputer', SimpleImputer(strategy='most_frequent')),
-    ('ohe', OneHotEncoder(handle_unknown='ignore'))]), cat_cols)],
-  remainder='drop'
-)
-pipe_rf = Pipeline([
-  ('preprocess', preprocess),
-  ('model', RandomForestRegressor(n_estimators=300, max_features='sqrt',
-    random_state=42, n_jobs=-1))
-])
-
-# CV loop: delta metrik saat fitur diacak
 imp_mae_folds, imp_rmse_folds, imp_r2_folds = [], [], []
+
 for k, (tr_idx, va_idx) in enumerate(cv.split(X_train, y_train), 1):
-  X_tr, X_va = X_train.iloc[tr_idx].copy(), X_train.iloc[va_idx].copy()
-  y_tr, y_va = y_train.iloc[tr_idx], y_train.iloc[va_idx]
+    X_tr, X_va = X_train.iloc[tr_idx].copy(), X_train.iloc[va_idx].copy()
+    y_tr, y_va = y_train.iloc[tr_idx], y_train.iloc[va_idx]
 
-  pipe_rf.fit(X_tr, y_tr)
+    pipe_rf.fit(X_tr, y_tr)
+    yhat_base = pipe_rf.predict(X_va)
+    base_mae  = mean_absolute_error(y_va, yhat_base)
+    base_rmse = np.sqrt(mean_squared_error(y_va, yhat_base))
+    base_r2   = r2_score(y_va, yhat_base)
 
-  yhat_base = pipe_rf.predict(X_va)
-  base_mae  = mean_absolute_error(y_va, yhat_base)
-  base_rmse = np.sqrt(mean_squared_error(y_va, yhat_base))
-  base_r2   = r2_score(y_va, yhat_base)
+    rng = np.random.default_rng(42 + k)
+    d_mae, d_rmse, d_r2 = {}, {}, {}
+    for f in feat_orig:
+        Xp = X_va.copy()
+        v = Xp[f].to_numpy(copy=True); rng.shuffle(v); Xp[f] = v
+        yhat_p = pipe_rf.predict(Xp)
+        d_mae[f]  = mean_absolute_error(y_va, yhat_p) - base_mae
+        d_rmse[f] = np.sqrt(mean_squared_error(y_va, yhat_p)) - base_rmse
+        d_r2[f]   = base_r2 - r2_score(y_va, yhat_p)
+    imp_mae_folds.append(d_mae); imp_rmse_folds.append(d_rmse); imp_r2_folds.append(d_r2)
 
-  rng = np.random.default_rng(42 + k)
-  d_mae, d_rmse, d_r2 = {}, {}, {}
-
-  for f in feat_orig:
-    Xp = X_va.copy()
-    v = Xp[f].to_numpy(copy=True); rng.shuffle(v); Xp[f] = v
-    yhat_p = pipe_rf.predict(Xp)
-    d_mae[f]  = mean_absolute_error(y_va, yhat_p) - base_mae
-    d_rmse[f] = np.sqrt(mean_squared_error(y_va, yhat_p)) - base_rmse
-    d_r2[f]   = base_r2 - r2_score(y_va, yhat_p)
-
-  imp_mae_folds.append(d_mae); imp_rmse_folds.append(d_rmse); imp_r2_folds.append(d_r2)
-
-# Aggregasi antar fold
 def _avg(tbls):
     keys = set().union(*[t.keys() for t in tbls])
     return (pd.Series({k: np.mean([t.get(k, 0.0) for t in tbls]) for k in keys})
-      .sort_values(ascending=False).reset_index())
+            .sort_values(ascending=False).reset_index())
 
 imp_mae_tbl  = _avg(imp_mae_folds);  imp_mae_tbl.columns  = ["feature","perm_importance_MAE"]
-imp_rmse_tbl = _avg(imp_rmse_folds); imp_rmse_tbl.columns = ["feature","perm_importance_RMSE"]
-imp_r2_tbl   = _avg(imp_r2_folds);   imp_r2_tbl.columns   = ["feature","perm_importance_R2"]
 
-print(">> Top-10 — MAE");  display(imp_mae_tbl.head(10))
-print(">> Top-10 — RMSE"); display(imp_rmse_tbl.head(10))
-print(">> Top-10 — R²");   display(imp_r2_tbl.head(10))
+st.subheader("Exploratory Permutation Importance (ΔMAE)")
+st.altair_chart(
+    alt.Chart(imp_mae_tbl.head(20)).mark_bar().encode(
+        x=alt.X("perm_importance_MAE:Q", title="ΔMAE (lebih besar = lebih penting)"),
+        y=alt.Y("feature:N", sort='-x'),
+        tooltip=["feature", alt.Tooltip("perm_importance_MAE:Q", format=".4f")]
+    ).properties(height=400),
+    use_container_width=True
+)
 
-"""# Tuning via CV
+"""Tuning via CV"""
 
-## Preprocessing
-"""
-
-# helper RMSE (kompat untuk sklearn lama/baru)
 def rmse_metric(y_true, y_pred):
-  try: return mean_squared_error(y_true, y_pred, squared=False)
-  except TypeError: return np.sqrt(mean_squared_error(y_true, y_pred))
+    try: return mean_squared_error(y_true, y_pred, squared=False)
+    except TypeError: return np.sqrt(mean_squared_error(y_true, y_pred))
 
-# preprocess
-if "num_cols" not in globals() or "cat_cols" not in globals():
-  num_cols = X_train.select_dtypes(include=[np.number]).columns.tolist()
-  cat_cols = X_train.select_dtypes(exclude=[np.number]).columns.tolist()
-
-if "preprocess_tree" not in globals():
-  preprocess_tree = ColumnTransformer([
+preprocess_tree = ColumnTransformer([
     ("num", Pipeline([("imp", SimpleImputer(strategy="median"))]), num_cols),
     ("cat", Pipeline([("imp", SimpleImputer(strategy="most_frequent")),
-      ("ohe", OneHotEncoder(handle_unknown="ignore"))]), cat_cols),
-  ])
-
-if "preprocess_linear" not in globals():
-  preprocess_linear = ColumnTransformer([
-    ("num", Pipeline([("imp", SimpleImputer(strategy="median")),
-      ("sc", StandardScaler())]), num_cols),
+                      ("ohe", OneHotEncoder(handle_unknown="ignore"))]), cat_cols),
+])
+preprocess_linear = ColumnTransformer([
+    ("num", Pipeline([("imp", SimpleImputer(strategy="median")), ("sc", StandardScaler())]), num_cols),
     ("cat", Pipeline([("imp", SimpleImputer(strategy="most_frequent")),
-      ("ohe", OneHotEncoder(handle_unknown="ignore"))]), cat_cols),
-  ])
-
-"""## Tuning via CV (MAE)"""
+                      ("ohe", OneHotEncoder(handle_unknown="ignore"))]), cat_cols),
+])
 
 cv = KFold(n_splits=5, shuffle=True, random_state=42)
 scoring = "neg_mean_absolute_error"
 
 cands = [
   ("Ridge",
-  Pipeline([("preprocess", preprocess_linear), ("model", Ridge())]),
-  {"model__alpha":[0.1, 1.0, 10.0]}),
+   Pipeline([("preprocess", preprocess_linear), ("model", Ridge())]),
+   {"model__alpha":[0.1, 1.0, 10.0]}),
 
   ("Lasso",
-  Pipeline([("preprocess", preprocess_linear), ("model", Lasso(max_iter=10000))]),
-  {"model__alpha":[0.001, 0.01, 0.1, 1.0]}),
+   Pipeline([("preprocess", preprocess_linear), ("model", Lasso(max_iter=10000))]),
+   {"model__alpha":[0.001, 0.01, 0.1, 1.0]}),
 
   ("Decision Tree",
-  Pipeline([("preprocess", preprocess_tree), ("model", DecisionTreeRegressor(random_state=42))]),
-  {"model__max_depth":[3,5,8,None], "model__min_samples_leaf":[1,3,5]}),
+   Pipeline([("preprocess", preprocess_tree), ("model", DecisionTreeRegressor(random_state=42))]),
+   {"model__max_depth":[3,5,8,None], "model__min_samples_leaf":[1,3,5]}),
 
   ("Random Forest",
-  Pipeline([("preprocess", preprocess_tree), ("model", RandomForestRegressor(random_state=42, n_jobs=-1))]),
-  {"model__n_estimators":[200,400], "model__max_depth":[None,8,12], "model__min_samples_leaf":[1,2,4]}),
+   Pipeline([("preprocess", preprocess_tree), ("model", RandomForestRegressor(random_state=42, n_jobs=-1))]),
+   {"model__n_estimators":[200,400], "model__max_depth":[None,8,12], "model__min_samples_leaf":[1,2,4]}),
 ]
 
-# tambah XGBoost kalau tersedia
+has_xgb = False
 try:
-  from xgboost import XGBRegressor
-  cands.append((
-    "XGBoost",
-    Pipeline([("preprocess", preprocess_tree),
-      ("model", XGBRegressor(random_state=42, n_jobs=-1, tree_method="hist", eval_metric="mae"))]),
-    {"model__n_estimators":[300,600], "model__max_depth":[3,6],
-    "model__learning_rate":[0.05,0.1], "model__subsample":[0.8,1.0], "model__colsample_bytree":[0.8,1.0]}
-  ))
+    from xgboost import XGBRegressor
+    has_xgb = True
+    cands.append((
+        "XGBoost",
+        Pipeline([("preprocess", preprocess_tree),
+                  ("model", XGBRegressor(random_state=42, n_jobs=-1, tree_method="hist", eval_metric="mae"))]),
+        {"model__n_estimators":[300,600], "model__max_depth":[3,6],
+         "model__learning_rate":[0.05,0.1], "model__subsample":[0.8,1.0], "model__colsample_bytree":[0.8,1.0]}
+    ))
 except Exception:
-  pass
-
-"""## Evaluasi di Test"""
+    pass
 
 rows, best_models = [], {}
 for name, pipe, grid in cands:
-  # baseline (pre-tuning) – fit default, nilai di test
-  pipe.fit(X_train, y_train)
-  y_hat_pre = pipe.predict(X_test)
-  mae_pre  = mean_absolute_error(y_test, y_hat_pre)
-  rmse_pre = rmse_metric(y_test, y_hat_pre)
-  r2_pre   = r2_score(y_test, y_hat_pre)
+    pipe.fit(X_train, y_train)
+    y_hat_pre = pipe.predict(X_test)
+    mae_pre  = mean_absolute_error(y_test, y_hat_pre)
+    rmse_pre = rmse_metric(y_test, y_hat_pre)
+    r2_pre   = r2_score(y_test, y_hat_pre)
 
-  # tuning via GridSearchCV
-  gs = GridSearchCV(pipe, grid, cv=cv, scoring=scoring, n_jobs=-1, refit=True, verbose=0)
-  gs.fit(X_train, y_train)
-  best_models[name] = gs.best_estimator_
+    gs = GridSearchCV(pipe, grid, cv=cv, scoring=scoring, n_jobs=-1, refit=True, verbose=0)
+    gs.fit(X_train, y_train)
+    best_models[name] = gs.best_estimator_
 
-  y_hat_post = gs.predict(X_test)
-  rows.append({
-    "model": name,
-    "mae_pre": mae_pre, "rmse_pre": rmse_pre, "r2_pre": r2_pre,
-    "mae_post": mean_absolute_error(y_test, y_hat_post),
-    "rmse_post": rmse_metric(y_test, y_hat_post),
-    "r2_post": r2_score(y_test, y_hat_post),
-    "best_params": gs.best_params_,
-  })
+    y_hat_post = gs.predict(X_test)
+    rows.append({
+        "model": name,
+        "mae_pre": mae_pre, "rmse_pre": rmse_pre, "r2_pre": r2_pre,
+        "mae_post": mean_absolute_error(y_test, y_hat_post),
+        "rmse_post": rmse_metric(y_test, y_hat_post),
+        "r2_post": r2_score(y_test, y_hat_post),
+        "best_params": gs.best_params_,
+    })
 
-# tabel perbandingan & pilih terbaik
 cmp = pd.DataFrame(rows).sort_values("mae_post").reset_index(drop=True)
-display(cmp)
+st.subheader("Perbandingan Model (Before vs After Tuning)")
+st.dataframe(cmp, use_container_width=True)
 
 best_name = cmp.loc[0, "model"]
 best_pipe = best_models[best_name]
-print(f">> Best by CV (MAE): {best_name}\nParams: {cmp.loc[0,'best_params']}")
+st.success(f"Best by CV (MAE): **{best_name}**")
 
-"""# Pemilihan Model
+"""Pemilihan Model"""
 
 ## Preprocessor
-"""
-
 num_transform_tree = Pipeline(steps=[
   ("imputer", SimpleImputer(strategy="median"))
 ])
@@ -388,11 +352,9 @@ preprocess_linear = ColumnTransformer(
   remainder="drop"
 )
 
-"""## Linear Regression: Ridge & Lasso"""
+""" Linear Regression: Ridge & Lasso"""
 
 # Helper: inisiasi estimator hanya dengan parameter yang didukung
-from inspect import signature
-
 def init_supported(estimator_cls, **kwargs):
   """Return estimator_cls(**filtered_kwargs) where unsupported keys are dropped."""
   params = signature(estimator_cls.__init__).parameters
@@ -402,8 +364,6 @@ def init_supported(estimator_cls, **kwargs):
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 import numpy as np
 
-print(">>> FUNGSI INI DIJALANKAN <<<")
-
 def evaluate(model, X_tr, y_tr, X_te, y_te, name="Model"):
   pred_tr = model.predict(X_tr)
   pred_te = model.predict(X_te)
@@ -412,11 +372,11 @@ def evaluate(model, X_tr, y_tr, X_te, y_te, name="Model"):
   rmse_te = np.sqrt(mean_squared_error(y_te, pred_te))
   r2_te = r2_score(y_te, pred_te)
 
-  print(f"\n {name}")
-  print(f"Train MAE : {mae_tr:.3f}")
-  print(f"Test  MAE : {mae_te:.3f}")
-  print(f"Test  RMSE: {rmse_te:.3f}")
-  print(f"Test  R2  : {r2_te:.3f}")
+  st.write(f"\n {name}")
+  st.write(f"Train MAE : {mae_tr:.3f}")
+  st.write(f"Test  MAE : {mae_te:.3f}")
+  st.write(f"Test  RMSE: {rmse_te:.3f}")
+  st.write(f"Test  R2  : {r2_te:.3f}")
   return {"name": name, "mae": mae_te, "rmse": rmse_te, "r2": r2_te}
 
 results = []
@@ -436,7 +396,7 @@ lasso_pipe.fit(X_train, y_train)
 res_lasso = evaluate(lasso_pipe, X_train, y_train, X_test, y_test, "Lasso")
 results.append(res_lasso)
 
-"""## Decision Tree"""
+## Decision Tree"""
 
 tree_pipe = Pipeline(steps=[
   ("preprocess", preprocess_tree),
@@ -446,7 +406,7 @@ tree_pipe.fit(X_train, y_train)
 res_tree = evaluate(tree_pipe, X_train, y_train, X_test, y_test, "Decision Tree")
 results.append(res_tree)
 
-"""## Random Forest"""
+## Random Forest"""
 
 rf_pipe = Pipeline(steps=[
   ("preprocess", preprocess_tree),
@@ -456,7 +416,7 @@ rf_pipe.fit(X_train, y_train)
 res_rf = evaluate(rf_pipe, X_train, y_train, X_test, y_test, "Random Forest")
 results.append(res_rf)
 
-"""## XGBoost"""
+## XGBoost"""
 
 if has_xgb:
   xgb_pipe = Pipeline(steps=[
@@ -471,7 +431,7 @@ if has_xgb:
   res_xgb = evaluate(xgb_pipe, X_train, y_train, X_test, y_test, "XGBoost")
   results.append(res_xgb)
 
-"""## Tabel Ringkasan (Evaluasi)"""
+## Tabel Ringkasan (Evaluasi)"""
 
 import pandas as pd
 
@@ -490,97 +450,64 @@ df_res = df_res.sort_values('mae').reset_index(drop=True)
 df_res.insert(0, 'rank', range(1, len(df_res)+1))
 df_res[['mae','rmse','r2']] = df_res[['mae','rmse','r2']].round(3)
 
-display(df_res)
+st.dataframe(df_res, use_container_width=True)
 
-"""# Feature Importance untuk model TERBAIK"""
-
-from sklearn.inspection import permutation_importance
-
-# Ambil nama model terbaik
-best_name = df_res.sort_values('mae').iloc[0]['name']
-
-# Mapping nama -> pipeline yang sudah kamu fit
-model_map = {
-  'Ridge': globals().get('ridge_pipe'),
-  'Lasso': globals().get('lasso_pipe'),
-  'Decision Tree': globals().get('tree_pipe'),
-  'Random Forest': globals().get('rf_pipe'),
-  'XGBoost': globals().get('xgb_pipe'),
-}
-pipe = model_map[best_name]
-assert pipe is not None, f"Pipeline untuk {best_name} tidak ditemukan."
-
-# Ambil nama fitur setelah preprocess (num + OHE cat)
+"""Feature Importance untuk model TERBAIK"""
+pipe = best_pipe
 ct  = pipe.named_steps['preprocess']
-num_cols = list(ct.transformers_[0][2])
-ohe      = ct.named_transformers_['cat'].named_steps['ohe']
-cat_cols = ct.transformers_[1][2]
-feat_names = num_cols + list(ohe.get_feature_names_out(cat_cols))
-
-"""## Intrinsic importance"""
+try:
+    feat_names = list(ct.get_feature_names_out())
+except Exception:
+    num_names = list(ct.transformers_[0][2])
+    cat_base  = ct.transformers_[1][2]
+    ohe       = ct.named_transformers_['cat'].named_steps['ohe']
+    feat_names = num_names + list(ohe.get_feature_names_out(cat_base))
 
 mdl = pipe.named_steps['model']
+fi_intrinsic = None
 if hasattr(mdl, "feature_importances_"):
-  fi_intrinsic = pd.DataFrame({
-        "feature": feat_names,
-        "importance": mdl.feature_importances_
-  }).sort_values("importance", ascending=False).reset_index(drop=True)
+    fi_intrinsic = pd.DataFrame({"feature": feat_names, "importance": mdl.feature_importances_}) \
+                    .sort_values("importance", ascending=False)
 elif hasattr(mdl, "coef_"):
-  coef = np.ravel(mdl.coef_)
-  fi_intrinsic = pd.DataFrame({
-    "feature": feat_names,
-    "coef": coef,
-    "abs_coef": np.abs(coef)
-  }).sort_values("abs_coef", ascending=False).reset_index(drop=True)
+    coef = np.ravel(mdl.coef_)
+    fi_intrinsic = pd.DataFrame({"feature": feat_names, "importance": np.abs(coef)}) \
+                    .sort_values("importance", ascending=False)
+
+st.subheader("Intrinsic Importance / Coefficients")
+if fi_intrinsic is not None:
+    st.altair_chart(
+        alt.Chart(fi_intrinsic.head(20)).mark_bar().encode(
+            x=alt.X("importance:Q"),
+            y=alt.Y("feature:N", sort='-x'),
+            tooltip=["feature", alt.Tooltip("importance:Q", format=".4f")]
+        ).properties(height=400),
+        use_container_width=True
+    )
 else:
-  fi_intrinsic = None
+    st.info("Model tidak expose importance/coef.")
 
-print(f"Intrinsic importance / coefficients — {best_name}")
-display(fi_intrinsic.head(20)
-  if fi_intrinsic
-    is not None
-  else pd.DataFrame({"info":["Model tidak expose importance/coef"]})
-)
-
-"""## Permutation importance (model-agnostic)"""
-
-# Hitung PI
+st.subheader("Permutation Importance (model-agnostic, ΔMAE)")
 r = permutation_importance(
-  pipe, X_test, y_test,
-  n_repeats=20, random_state=42, n_jobs=-1,
-  scoring=lambda est, X, y: -mean_absolute_error(y, est.predict(X))
+    pipe, X_test, y_test,
+    n_repeats=20, random_state=42, n_jobs=-1,
+    scoring=lambda est, X, y: -mean_absolute_error(y, est.predict(X))
 )
-imp = -r.importances_mean  # besar = lebih penting
-
-# Ambil nama kolom dari preprocessor yg SUDAH fit
-ct = pipe.named_steps['preprocess']
-try:
-  feat_names = ct.get_feature_names_out()
-except Exception:
-  num_names = list(ct.transformers_[0][2])
-  cat_base  = ct.transformers_[1][2]
-  ohe = ct.named_transformers_['cat'].named_steps['ohe']
-  feat_names = np.array(num_names + list(ohe.get_feature_names_out(cat_base)))
-feat_names = np.array(feat_names)
-
-# Samakan panjang (pakai yang minimum)
+imp = -r.importances_mean
 k = min(len(feat_names), len(imp))
-if len(feat_names) != len(imp):
-  print(f"[info] feature-name len = {len(feat_names)}, importances len = {len(imp)}, dipotong ke {k}")
+perm_mae = (pd.DataFrame({"feature": np.array(feat_names)[:k], "perm_importance_MAE": imp[:k]})
+            .sort_values("perm_importance_MAE", ascending=False).head(20))
+st.altair_chart(
+    alt.Chart(perm_mae).mark_bar().encode(
+        x=alt.X("perm_importance_MAE:Q", title="ΔMAE"),
+        y=alt.Y("feature:N", sort='-x'),
+        tooltip=["feature", alt.Tooltip("perm_importance_MAE:Q", format=".4f")]
+    ).properties(height=400),
+    use_container_width=True
+)
 
-perm_mae = (pd.DataFrame({
-  "feature": feat_names[:k],
-  "perm_importance_MAE": imp[:k]
-})
-.sort_values("perm_importance_MAE", ascending=False)
-.reset_index(drop=True))
+"""Visualisasi
 
-print(f"\n Permutation importance (MAE) — {best_name}")
-display(perm_mae.head(20))
-
-"""# Visualisasi
-
-## Parity + Residuals
+Parity + Residuals
 """
 
 y_pred = pipe.predict(X_test)
@@ -605,9 +532,9 @@ axes[2].axhline(0, linestyle='--')
 axes[2].set_xlabel("Predicted"); axes[2].set_ylabel("Residual"); axes[2].set_title("Residual vs Predicted")
 
 plt.tight_layout()
-plt.show()
+st.pyplot(plt.gcf())
 
-"""## Error per segmen (opsional cepat)"""
+"""Error per segmen (opsional cepat)"""
 
 df_te = X_test.copy()
 df_te["y_true"] = y_test
@@ -618,12 +545,9 @@ for c in [col for col in ["Weather","Traffic_Level","Time_of_Day","Vehicle_Type"
   seg = (df_te.groupby(c)["abs_err"].agg(["count","mean","median","max"]).sort_values("mean"))
   print(f"\n Segment MAE by {c}"); display(seg.head(10))
 
-"""## PDP (Partial Dependence) untuk fitur numerik utama"""
+"""PDP (Partial Dependence) untuk fitur numerik utama"""
 
 # pilih 2–3 fitur numerik yang relevan
-from sklearn.inspection import PartialDependenceDisplay
-import matplotlib.pyplot as plt
-
 cand = [f for f in ["Distance_km","Preparation_Time_min","Courier_Experience_yrs"] if f in X_test.columns]
 if not cand:
   cand = num_cols[:min(3, len(num_cols))]
@@ -632,6 +556,7 @@ fig, axes = plt.subplots(1, len(cand), figsize=(6*len(cand), 4))
 if len(cand) == 1:
   axes = [axes]
 
+fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 for ax, f in zip(axes, cand):
   PartialDependenceDisplay.from_estimator(
     pipe, X_test, [f],
@@ -642,7 +567,7 @@ for ax, f in zip(axes, cand):
   ax.set_title(f"PDP — {f}")
 
 plt.tight_layout()
-plt.show()
+st.pyplot(fig)
 
 cand = [f for f in ["Distance_km","Preparation_Time_min","Courier_Experience_yrs"] if f in X_test.columns]
 if not cand:
@@ -652,6 +577,7 @@ fig, axes = plt.subplots(1, len(cand), figsize=(6*len(cand), 4))
 if len(cand) == 1:
   axes = [axes]
 
+fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 for ax, f in zip(axes, cand):
   PartialDependenceDisplay.from_estimator(
     pipe, X_test, [f],
@@ -662,7 +588,7 @@ for ax, f in zip(axes, cand):
   ax.set_title(f"PDP — {f}")
 
 plt.tight_layout()
-plt.show()
+st.pyplot(fig)
 
 pairs = [("Distance_km","Preparation_Time_min"),
          ("Distance_km","Courier_Experience_yrs")]
@@ -670,7 +596,7 @@ for a,b in pairs:
     if a in X_test.columns and b in X_test.columns:
         PartialDependenceDisplay.from_estimator(pipe, X_test, [(a,b)], grid_resolution=30)
         plt.title(f"PDP — ({a}, {b})")
-        plt.show()
+        st.pyplot(fig)
 
 for name, p in [("Random Forest", rf_pipe), ("XGBoost", xgb_pipe)]:
     if p is not None:
@@ -678,9 +604,9 @@ for name, p in [("Random Forest", rf_pipe), ("XGBoost", xgb_pipe)]:
             if f in X_test.columns:
                 PartialDependenceDisplay.from_estimator(p, X_test, [f], grid_resolution=50)
                 plt.title(f"PDP — {name} — {f}")
-                plt.show()
+                st.pyplot(fig)
 
-"""# Optimasi/tuning via CV"""
+"""Optimasi/tuning via CV"""
 
 # helper RMSE (kompatibel versi sklearn lama/baru)
 def rmse_metric(y_true, y_pred):
@@ -693,8 +619,7 @@ def rmse_metric(y_true, y_pred):
 df_pre = df_res[['name','mae','rmse','r2']].copy()
 df_pre.columns = ['model','mae_pre','rmse_pre','r2_pre']
 
-"""## Tuning"""
-
+## Tuning"""
 cv = KFold(n_splits=5, shuffle=True, random_state=42)
 scoring = "neg_mean_absolute_error"
 
@@ -741,7 +666,7 @@ try:
 except Exception:
   pass
 
-"""## GridSearchCV tiap model + Evaluasi Test"""
+## GridSearchCV tiap model + Evaluasi Test"""
 
 rows_post = []
 best_models = {}
@@ -765,27 +690,28 @@ df_post = pd.DataFrame(rows_post)
 cmp = (df_pre.merge(df_post, on="model", how="outer")
   .sort_values("mae_post")
   .reset_index(drop=True))
-display(cmp)
+st.dataframe(cmp, use_container_width=True)
 
 best_name = cmp.iloc[0]["model"]
-print(f"\n>> Best by CV (MAE): {best_name}\nParams: {cmp.iloc[0]['best_params']}")
+st.write(f"\n>> Best by CV (MAE): {best_name}\nParams: {cmp.iloc[0]['best_params']}")
 best_pipe = best_models[best_name]
 
-"""# Feature engineering"""
+"""Feature engineering"""
 
+model_final = best_pipe
+y_pred = model_final.predict(X_test)
 if 'X_train_fe' in globals() and 'X_test_fe' in globals():
   try:
     best_pipe.fit(X_train_fe, y_train)
     _y_pred_fe = best_pipe.predict(X_test_fe)
-    print("[info] Refit best_pipe dengan fitur rekayasa berhasil.")
-    print("MAE (FE): ", mean_absolute_error(y_test, _y_pred_fe))
+    st.write("[info] Refit best_pipe dengan fitur rekayasa berhasil.")
+    st.write("MAE (FE): ", mean_absolute_error(y_test, _y_pred_fe))
   except Exception as e:
-    print("[warn] Refit dengan fitur rekayasa gagal, pakai fitur lama saja:", e)
+    st.write("[warn] Refit dengan fitur rekayasa gagal, pakai fitur lama saja:", e)
 
-"""## Tambah fitur waktu (ordinal & cyclical) + interaksi
+## Tambah fitur waktu (ordinal & cyclical) + interaksi
 
 ### Fitur waktu dari Time_of_Day
-"""
 
 def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
   df = df.copy()
@@ -802,7 +728,7 @@ def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
     df["tod_cos"] = np.cos(2 * np.pi * h / 24.0)
   return df
 
-"""### Interaksi: Distance_km × Traffic_Level; Preparation_Time_min × Weather"""
+### Interaksi: Distance_km × Traffic_Level; Preparation_Time_min × Weather
 
 def build_interaction_maker(X_train: pd.DataFrame):
   levels_traffic = X_train["Traffic_Level"].dropna().unique().tolist() if "Traffic_Level" in X_train.columns else []
@@ -831,15 +757,15 @@ add_interactions = build_interaction_maker(X_train_fe)
 X_train_fe = add_interactions(X_train_fe)
 X_test_fe  = add_interactions(X_test_fe)
 
-"""### Update daftar kolom numerik & kategorikal untuk ColumnTransformer"""
+"""Update daftar kolom numerik & kategorikal untuk ColumnTransformer"""
 
 num_cols = X_train_fe.select_dtypes(include=[np.number]).columns.tolist()
 cat_cols = X_train_fe.select_dtypes(include=["object", "string"]).columns.tolist()
 
-print("Numerik baru:", [c for c in ["Time_of_Day_ord","tod_sin","tod_cos"] if c in num_cols][:3], "...")
-print("Contoh interaksi numerik:", [c for c in X_train_fe.columns if c.startswith(("Dist_x_Traffic","Prep_x_Weather"))][:4])
+st.write("Numerik baru:", [c for c in ["Time_of_Day_ord","tod_sin","tod_cos"] if c in num_cols][:3], "...")
+st.write("Contoh interaksi numerik:", [c for c in X_train_fe.columns if c.startswith(("Dist_x_Traffic","Prep_x_Weather"))][:4])
 
-"""# Final evaluation (setelah tuning)"""
+"""Final evaluation (setelah tuning)"""
 
 # helper RMSE: kompatibel untuk sklearn lama/baru
 def rmse_metric(y_true, y_pred):
@@ -848,7 +774,7 @@ def rmse_metric(y_true, y_pred):
   except TypeError:
     return np.sqrt(mean_squared_error(y_true, y_pred))
 
-"""## Model terbik hasil Tuning + Prediksi dalam Metrics"""
+## Model terbik hasil Tuning + Prediksi dalam Metrics"""
 
 # Ambil model terbaik hasil tuning
 if "best_pipe" in globals():
@@ -873,103 +799,82 @@ metrics = {
     r2_score(y_test,  y_te_pred)],
 }
 df_final_eval = pd.DataFrame(metrics)
-print(" Final Evaluation (post-tuning)")
-display(df_final_eval.round(3))
+st.write(" Final Evaluation (post-tuning)")
+st.dataframe(df_final_eval.round(3), use_container_width=True)
 
-"""## Visualisasi Diagnostik"""
+#Visualisasi Diagnostik"""
+st.subheader("Visualisasi Diagnostik (tooltip)")
 
-resid = y_test - y_te_pred
-fig, axes = plt.subplots(1, 3, figsize=(16, 4))
+y_pred = pipe.predict(X_test)
+resid  = y_test - y_pred
+diag = pd.DataFrame({"actual": y_test, "pred": y_pred, "resid": resid})
 
-# Parity: Actual vs Predicted
-axes[0].scatter(y_test, y_te_pred, alpha=0.6)
-mn, mx = np.min([y_test.min(), y_te_pred.min()]), np.max([y_test.max(), y_te_pred.max()])
-axes[0].plot([mn, mx], [mn, mx], ls="--")
-axes[0].set_title("Parity Plot")
-axes[0].set_xlabel("Actual")
-axes[0].set_ylabel("Predicted")
+c1, c2, c3 = st.columns(3)
+with c1:
+    st.caption("Actual vs Predicted")
+    st.altair_chart(
+        alt.Chart(diag).mark_circle().encode(
+            x="actual:Q", y="pred:Q",
+            tooltip=[alt.Tooltip("actual:Q", format=".2f"),
+                     alt.Tooltip("pred:Q", format=".2f"),
+                     alt.Tooltip("resid:Q", format=".2f")]
+        ),
+        use_container_width=True
+    )
+with c2:
+    st.caption("Residual Histogram")
+    st.altair_chart(
+        alt.Chart(diag)
+        .transform_bin("bin_resid", field="resid", bin=alt.Bin(maxbins=30))
+        .mark_bar()
+        .encode(
+            x=alt.X("bin_resid:Q", title="Residual"),
+            y=alt.Y("count():Q", title="Count"),
+            tooltip=[alt.Tooltip("bin_resid:Q", title="Residual bin")]
+        ),
+        use_container_width=True
+    )
+with c3:
+    st.caption("Residual vs Predicted")
+    rule = alt.Chart(pd.DataFrame({"y":[0]})).mark_rule().encode(y="y:Q")
+    st.altair_chart(
+        alt.Chart(diag).mark_circle().encode(
+            x="pred:Q", y="resid:Q",
+            tooltip=[alt.Tooltip("pred:Q", format=".2f"),
+                     alt.Tooltip("resid:Q", format=".2f")]
+        ) + rule,
+        use_container_width=True
+    )
 
-# Residual vs Predicted
-axes[1].scatter(y_te_pred, resid, alpha=0.6)
-axes[1].axhline(0, ls="--")
-axes[1].set_title("Residuals vs Predicted")
-axes[1].set_xlabel("Predicted")
-axes[1].set_ylabel("Residual")
+"""Finalisasi"""
 
-# Histogram Residuals
-axes[2].hist(resid, bins=20)
-axes[2].set_title("Residuals Histogram")
-axes[2].set_xlabel("Residual")
-axes[2].set_ylabel("Count")
+st.subheader("Final Evaluation")
+def rmse_metric_final(y_true, y_pred):
+    try: return mean_squared_error(y_true, y_pred, squared=False)
+    except TypeError: return np.sqrt(mean_squared_error(y_true, y_pred))
 
-plt.tight_layout()
-plt.show()
+y_tr_pred = pipe.predict(X_train)
+y_te_pred = pipe.predict(X_test)
 
-"""# Finalisasi"""
+df_final_eval = pd.DataFrame({
+    "split": ["Train","Test"],
+    "MAE": [mean_absolute_error(y_train, y_tr_pred),
+            mean_absolute_error(y_test,  y_te_pred)],
+    "RMSE": [rmse_metric_final(y_train, y_tr_pred),
+             rmse_metric_final(y_test,  y_te_pred)],
+    "R2": [r2_score(y_train, y_tr_pred),
+           r2_score(y_test,  y_te_pred)],
+}).round(3)
+st.dataframe(df_final_eval, use_container_width=True)
 
-import os, datetime
-
-"""## Ambil model + Prediksi + Metrik"""
-
-# ambil model & data (pakai yang ada)
-final_model = globals().get("best_pipe", globals().get("pipe"))
-assert final_model is not None, "Tidak menemukan model final (best_pipe/pipe). Jalankan tuning/fit dulu."
-
-Xte = globals().get("X_test_fe", globals().get("X_test"))
-yte = globals().get("y_test")
-assert Xte is not None and yte is not None, "X_test/y_test belum tersedia."
-
-# prediksi test
-y_pred = final_model.predict(Xte)
-
-# metrik utama
-TOL_MIN = 5.0  # ubah sesuai SLA bisnis
-mae  = mean_absolute_error(yte, y_pred)
-rmse = np.sqrt(mean_squared_error(yte, y_pred))  # kompatibel sklearn lama
-r2   = r2_score(yte, y_pred)
-pct_within = (np.abs(yte - y_pred) <= TOL_MIN).mean() * 100.0
-
-"""## Folder Artifacts"""
-
-ART = None
-for k in list(globals().keys()):
-  if isinstance(globals()[k], str) and k.startswith("ART") and os.path.isdir(globals()[k]):
-    ART = globals()[k]; break
-if ART is None:
-  ART = f"artifacts_{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}"
-  os.makedirs(ART, exist_ok=True)
-
-"""## Visualisasi"""
-
-fig = plt.figure(figsize=(10,4))
-
-# bar MAE & RMSE
-ax1 = plt.subplot(1,2,1)
-ax1.bar(["MAE (min)","RMSE (min)"], [mae, rmse])
-for i, v in enumerate([mae, rmse]):
-    ax1.text(i, v, f"{v:.2f}", ha="center", va="bottom")
-ax1.set_ylim(0, max(mae, rmse)*1.2)
-ax1.set_ylabel("Minutes")
-ax1.set_title("Error Metrics")
-
-# donut chart % within ±TOL
-ax2 = plt.subplot(1,2,2)
-vals = [pct_within, 100.0 - pct_within]
-wedges, _ = ax2.pie(vals, startangle=90, wedgeprops=dict(width=0.35))
-ax2.set_title(f"% within ±{int(TOL_MIN)} minutes")
-# center text
-ax2.text(0, 0, f"{pct_within:.1f}%", ha="center", va="center", fontsize=14, fontweight="bold")
-
-# Suptitle menyatakan tujuan + R2
-fig.suptitle(
-  f"Goal: Predict Delivery_Time_min  |  R² (Test) = {r2:.3f}",
-  fontsize=12, fontweight="bold"
+TOL_MIN = st.slider("Toleransi ± menit (untuk % within)", 1, 15, 5, 1)
+pct_within = (np.abs(y_test - y_te_pred) <= TOL_MIN).mean() * 100.0
+donut_df = pd.DataFrame({"label":["Within","Outside"], "value":[pct_within, 100-pct_within]})
+st.altair_chart(
+    alt.Chart(donut_df).mark_arc(innerRadius=70)
+    .encode(theta="value:Q", color="label:N",
+            tooltip=["label", alt.Tooltip("value:Q", format=".1f")])
+    .properties(width=300, height=300),
+    use_container_width=False
 )
-plt.tight_layout(rect=[0,0,1,0.92])
-
-out_path = os.path.join(ART, "metric_dashboard_test.png")
-plt.savefig(out_path, dpi=140)
-plt.show()
-
-print(f"Saved metric dashboard → {out_path}")
-print(f"MAE={mae:.3f}  RMSE={rmse:.3f}  R²={r2:.3f}  %within±{int(TOL_MIN)}m={pct_within:.1f}%")
+st.write(f"**% within ±{TOL_MIN} menit:** {pct_within:.1f}%")
