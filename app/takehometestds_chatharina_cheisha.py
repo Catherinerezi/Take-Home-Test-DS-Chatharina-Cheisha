@@ -801,11 +801,45 @@ st.dataframe(df_final_eval.round(3), use_container_width=True)
 #Visualisasi Diagnostik"""
 st.subheader("Visualisasi Diagnostik (tooltip)")
 
-y_pred = pipe.predict(X_test)
+# === DIAGNOSTIK: Actual/Pred/Residual (aman dari NotFittedError) ===
+import pandas as pd
+import altair as alt
+from sklearn.utils.validation import check_is_fitted
+import streamlit as st
+
+# Resolve model: session_state -> grid.best_estimator_ -> pipe
+def _get_model():
+    if 'model' in st.session_state and st.session_state['model'] is not None:
+        return st.session_state['model']
+    try:
+        # jika kamu pakai GridSearchCV dan variabelnya bernama 'grid'
+        if 'grid' in globals() and getattr(globals()['grid'], 'best_estimator_', None) is not None:
+            return globals()['grid'].best_estimator_
+    except Exception:
+        pass
+    # fallback: pakai pipe saja (asumsi sudah di-fit di tempat lain)
+    return globals().get('pipe', None)
+
+_model = _get_model()
+if _model is None:
+    st.error("Model tidak ditemukan. Latih model dulu.")
+    st.stop()
+
+# Pastikan model sudah fitted, kalau belum, hentikan dengan pesan yang jelas
+try:
+    check_is_fitted(_model)
+except Exception:
+    st.error("Model belum dilatih (NotFittedError). Klik Train dulu, atau simpan ke st.session_state['model'].")
+    st.stop()
+
+# Prediksi & residu
+y_pred = _model.predict(X_test)
 resid  = y_test - y_pred
 diag = pd.DataFrame({"actual": y_test, "pred": y_pred, "resid": resid})
 
+# Plot
 c1, c2, c3 = st.columns(3)
+
 with c1:
     st.caption("Actual vs Predicted")
     st.altair_chart(
@@ -817,6 +851,7 @@ with c1:
         ),
         use_container_width=True
     )
+
 with c2:
     st.caption("Residual Histogram")
     st.altair_chart(
@@ -830,6 +865,7 @@ with c2:
         ),
         use_container_width=True
     )
+
 with c3:
     st.caption("Residual vs Predicted")
     rule = alt.Chart(pd.DataFrame({"y":[0]})).mark_rule().encode(y="y:Q")
