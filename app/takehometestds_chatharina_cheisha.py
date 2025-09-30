@@ -798,46 +798,58 @@ df_final_eval = pd.DataFrame(metrics)
 st.write(" Final Evaluation (post-tuning)")
 st.dataframe(df_final_eval.round(3), use_container_width=True)
 
-#Visualisasi Diagnostik"""
+# Visualisasi Diagnostik"""
 st.subheader("Visualisasi Diagnostik (tooltip)")
 
-# === DIAGNOSTIK: Actual/Pred/Residual (aman dari NotFittedError) ===
+# DIAGNOSTIK: Actual/Pred/Residual (aman dari NotFittedError) ===
 import pandas as pd
 import altair as alt
 from sklearn.utils.validation import check_is_fitted
 import streamlit as st
 
-# Resolve model: session_state -> grid.best_estimator_ -> pipe
-def _get_model():
+# 1) Ambil model dari kandidat yang mungkin kamu punya
+def _resolve_model():
+    cand = []
+    # prioritas: yang ada di session_state dulu
     if 'model' in st.session_state and st.session_state['model'] is not None:
-        return st.session_state['model']
+        cand.append(st.session_state['model'])
+    # variabel umum yang sering dipakai setelah tuning
+    if 'best' in globals(): cand.append(globals()['best'])
+    if 'grid' in globals() and getattr(globals()['grid'], 'best_estimator_', None) is not None:
+        cand.append(globals()['grid'].best_estimator_)
+    if 'pipe' in globals(): cand.append(globals()['pipe'])
+    for m in cand:
+        if m is not None:
+            return m
+    return None
+
+model = _resolve_model()
+if model is None:
+    st.error("Model tidak ditemukan (nggak ada 'model', 'best', 'grid.best_estimator_', atau 'pipe').")
+    st.stop()
+
+# 2) Pastikan sudah fitted; kalau belum dan ada data latih, langsung fit
+def _ensure_fitted(m):
     try:
-        # jika kamu pakai GridSearchCV dan variabelnya bernama 'grid'
-        if 'grid' in globals() and getattr(globals()['grid'], 'best_estimator_', None) is not None:
-            return globals()['grid'].best_estimator_
+        check_is_fitted(m)
+        return m
     except Exception:
-        pass
-    # fallback: pakai pipe saja (asumsi sudah di-fit di tempat lain)
-    return globals().get('pipe', None)
+        if 'X_train' in globals() and 'y_train' in globals():
+            m.fit(X_train, y_train)
+            st.session_state['model'] = m  # simpan biar gak hilang saat rerun
+            return m
+        else:
+            st.error("Model belum dilatih dan data latih (X_train, y_train) tidak tersedia.")
+            st.stop()
 
-_model = _get_model()
-if _model is None:
-    st.error("Model tidak ditemukan. Latih model dulu.")
-    st.stop()
+model = _ensure_fitted(model)
 
-# Pastikan model sudah fitted, kalau belum, hentikan dengan pesan yang jelas
-try:
-    check_is_fitted(_model)
-except Exception:
-    st.error("Model belum dilatih (NotFittedError). Klik Train dulu, atau simpan ke st.session_state['model'].")
-    st.stop()
-
-# Prediksi & residu
-y_pred = _model.predict(X_test)
+# 3) Prediksi & residu
+y_pred = model.predict(X_test)
 resid  = y_test - y_pred
 diag = pd.DataFrame({"actual": y_test, "pred": y_pred, "resid": resid})
 
-# Plot
+# 4) Plot
 c1, c2, c3 = st.columns(3)
 
 with c1:
@@ -877,7 +889,7 @@ with c3:
         ) + rule,
         use_container_width=True
     )
-
+    
 """Finalisasi"""
 
 st.subheader("Final Evaluation")
